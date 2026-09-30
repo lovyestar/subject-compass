@@ -10,7 +10,7 @@
      Neis.fetchOffered(학교명, opt)  → { schoolName, schoolType, subjects[], ... }
      Neis.searchSchools(학교명, opt) → 후보 배열 (선택창 없음)
      Neis.pickSchool(후보배열, 검색어) → 선택창을 직접 띄움
-     Neis.ping(opt)                  → 프록시 연결 확인
+     Neis.verify(opt)                → 인증키 · 프록시를 실제 호출로 검증
 
    opt = { key, proxy, pick }
      pick: 'ask'(기본) 선택창 표시 / 'auto' 첫 후보 자동 선택
@@ -554,28 +554,100 @@ window.Neis = (function () {
     };
   }
 
-  /* ---------- 프록시 연결 확인 ---------- */
-  async function ping(opt) {
-    const proxy = opt && opt.proxy ? String(opt.proxy).replace(/\/+$/, '') : '';
-    if (!proxy) return { ok: false, message: '프록시 주소가 없습니다.' };
+  /* ---------- 인증키 · 프록시 실제 검증 ----------
+     나이스는 키 없이 호출하면 요청당 5행만 주는 샘플 모드로 응답하므로,
+     10행을 요청해 5행을 넘게 받으면 키가 실제로 적용된 것으로 봅니다.
+     프록시는 입력한 키를 자기 서버 키로 덮어쓰므로 키는 반드시 직접 검증합니다. */
+  const SAMPLE_ROWS = 5;
+  const probe = o => request('schoolInfo', { pSize: 10 }, o).then(rows => rows.length);
 
+  async function verifyKey(key) {
     try {
-      const res = await fetch(proxy + '/health');
-      const j = await res.json();
-      return {
-        ok: !!j.ok,
-        hasKey: !!j.hasKey,
-        message: j.ok
-          ? `프록시 정상 · 서버 키 ${j.hasKey ? '있음' : '없음'}`
-          : '프록시가 응답했으나 형식이 다릅니다.'
-      };
+      const n = await probe({ key });
+      return n > SAMPLE_ROWS
+        ? { status: 'ok', message: '인증키 확인됨' }
+        : { status: 'limited', message: '인증키가 적용되지 않아 샘플 모드로 응답했습니다' };
     } catch (e) {
-      return { ok: false, message: '프록시에 연결하지 못했습니다.' };
+      if (e.code === 'BAD_KEY') return { status: 'invalid', message: '유효하지 않은 인증키입니다' };
+      if (e.code === 'QUOTA')   return { status: 'quota', message: '인증키는 유효하지만 오늘 호출 한도를 초과했습니다' };
+      return { status: 'error', message: '나이스 서버에 연결하지 못해 인증키를 확인하지 못했습니다' };
     }
   }
 
+  async function verifyProxy(proxy, key) {
+    let u;
+    try { u = new URL(proxy); } catch (e) {
+      return { status: 'invalid', message: '프록시 주소 형식이 올바르지 않습니다' };
+    }
+    if (u.protocol !== 'https:') {
+      return { status: 'invalid', message: '프록시 주소는 https://로 시작해야 합니다' };
+    }
+
+    try {
+      const n = await probe({ proxy, key });
+      return n > SAMPLE_ROWS
+        ? { status: 'ok', message: '프록시 정상' }
+        : { status: 'limited', message: '프록시는 응답하지만 인증키가 적용되지 않아 샘플 모드입니다' };
+    } catch (e) {
+      if (e.code === 'NETWORK' || e.code === 'TIMEOUT')
+        return { status: 'error', message: '프록시에 연결하지 못했습니다. 주소를 확인해 주세요' };
+      if (e.code === 'PARSE')
+        return { status: 'invalid', message: '나이스 프록시가 아닌 주소입니다(JSON이 아닌 응답)' };
+      if (e.code === 'BAD_KEY')
+        return { status: 'invalid', message: '프록시의 서버 인증키가 유효하지 않습니다' };
+      if (e.code === 'QUOTA')
+        return { status: 'quota', message: '프록시의 서버 인증키가 오늘 호출 한도를 초과했습니다' };
+      if (/^HTTP_/.test(e.code))
+        return { status: 'invalid', message: `프록시가 ${e.code.slice(5)} 오류를 반환했습니다` };
+      return { status: 'error', message: '프록시 응답을 확인하지 못했습니다' };
+    }
+  }
+
+  /**
+   * @returns {Promise<{ok, level, mode, key, proxy, message}>}
+   *   level: 'ok' | 'warn' | 'err'
+   *   mode : 조회 시 실제로 쓰일 경로 — 'proxy' | 'direct' | 'sample'
+   */
+  async function verify(opt) {
+    const key = String((opt && opt.key) || '').trim();
+    const proxy = String((opt && opt.proxy) || '').trim().replace(/\/+$/, '');
+
+    const [k, p] = await Promise.all([
+      key ? verifyKey(key) : Promise.resolve({ status: 'none' }),
+      proxy ? verifyProxy(proxy, key) : Promise.resolve({ status: 'none' })
+    ]);
+
+    const bad = s => s === 'invalid' || s === 'error';
+    let mode = 'sample';
+    if (p.status === 'ok') mode = 'proxy';
+    else if (!proxy && (k.status === 'ok' || k.status === 'quota')) mode = 'direct';
+
+    const parts = [];
+    if (k.status !== 'none') parts.push(k.message);
+    if (p.status !== 'none') parts.push(p.message);
+
+    /* 실제 조회 경로가 막혔을 때만 오류로 봅니다. 프록시가 정상이면 입력한 키는 쓰이지 않습니다 */
+    let level;
+    if (bad(p.status) || (!proxy && bad(k.status))) level = 'err';
+    else if (mode === 'sample' || bad(k.status) || k.status === 'quota' || p.status === 'quota') level = 'warn';
+    else level = 'ok';
+
+    if (mode === 'proxy') {
+      parts.push(bad(k.status)
+        ? '조회는 프록시의 서버 인증키로 진행되어 입력한 키는 쓰이지 않습니다'
+        : '조회는 프록시의 서버 인증키로 진행됩니다');
+    }
+    if (mode === 'direct') parts.push('나이스에 직접 연결합니다');
+    if (mode === 'sample' && level !== 'err') {
+      parts.push('샘플 모드에서는 요청당 5건만 조회되어 시간표가 불완전할 수 있습니다');
+    }
+    if (!key && !proxy) parts.unshift('인증키와 프록시가 비어 있습니다');
+
+    return { ok: level !== 'err', level, mode, key: k, proxy: p, message: parts.join(' · ') + '.' };
+  }
+
   return {
-    fetchOffered, searchSchools, pickSchool, ping,
+    fetchOffered, searchSchools, pickSchool, verify,
     cleanSubject, normalize, typeLabel
   };
 })();

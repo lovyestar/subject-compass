@@ -301,6 +301,9 @@ svg { display: block; }
 .key-chip.is-on .kc-dot {
   background: #38bdf8; opacity: 1;
 }
+.key-chip.is-warn { background: var(--warn-bg); border-color: #f3d9a8; color: var(--warn); }
+.key-chip.is-err  { background: var(--err-bg);  border-color: #f4d2da; color: var(--err); }
+.key-chip.is-warn .kc-dot, .key-chip.is-err .kc-dot { opacity: 1; }
 .card {
   background: #fff; border: 1px solid var(--line); border-top: 3px solid var(--brand);
   border-radius: var(--r-lg); padding: 32px;

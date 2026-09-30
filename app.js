@@ -431,16 +431,81 @@
     } catch (e) {}
   }
 
-  function saveCfg() {
+  /* ---------- 인증 설정 · 실제 검증 ---------- */
+  let cfgCheck = null;   /* 마지막 검증 결과 { sig, level, mode, message, at } */
+
+  const currentCfg = () => ({
+    key:   val('fKey', '').trim(),
+    proxy: val('fProxy', '').trim().replace(/\/+$/, '')
+  });
+  const cfgSig = c => c.key + '|' + c.proxy;
+
+  /* 입력값이 마지막으로 검증한 값과 같을 때만 그 결과를 유효하게 봅니다 */
+  function activeCheck() {
+    return cfgCheck && cfgCheck.sig === cfgSig(currentCfg()) ? cfgCheck : null;
+  }
+
+  function renderKeyChip() {
+    const chip = $('keyChip'), tx = $('keyChipTx');
+    if (!chip || !tx) return;
+    const c = currentCfg();
+    const chk = activeCheck();
+
+    chip.classList.remove('is-on', 'is-warn', 'is-err');
+    if (!chk) {
+      tx.textContent = (c.key || c.proxy)
+        ? '인증 설정 미확인 · 설정 저장을 눌러 검증하세요'
+        : '인증키 없음 · 샘플 모드 또는 직접 입력으로 진행';
+      return;
+    }
+    if (chk.level === 'ok') {
+      chip.classList.add('is-on');
+      tx.textContent = chk.mode === 'proxy' ? '프록시 연결 확인됨' : '나이스 인증키 확인됨';
+    } else if (chk.level === 'warn') {
+      chip.classList.add('is-warn');
+      tx.textContent = chk.mode === 'sample' ? '샘플 모드 · 조회 결과가 일부만 나올 수 있음' : '인증 확인됨 · 주의 필요';
+    } else {
+      chip.classList.add('is-err');
+      tx.textContent = '인증 설정 오류 · 1단계에서 확인하세요';
+    }
+  }
+
+  function persistCfg(c) {
+    localStorage.setItem(LS_CFG, JSON.stringify({ key: c.key, proxy: c.proxy, check: cfgCheck }));
+  }
+
+  async function saveCfg() {
+    const c = currentCfg();
     try {
-      localStorage.setItem(LS_CFG, JSON.stringify({
-        key:   val('fKey', '').trim(),
-        proxy: val('fProxy', '').trim().replace(/\/+$/, '')
-      }));
-      console.info('[app.js] 인증키/프록시 설정 저장됨');
-      say('cfgState', '설정을 저장했습니다. 이 브라우저에만 보관됩니다.', 'ok');
+      persistCfg(c);
     } catch (e) {
       say('cfgState', '브라우저 저장소를 사용할 수 없습니다.', 'err');
+      return;
+    }
+
+    if (typeof window.Neis === 'undefined' || !window.Neis.verify) {
+      say('cfgState', '설정은 저장했지만 neis.js가 로드되지 않아 검증하지 못했습니다.', 'warn');
+      return;
+    }
+
+    const btn = $('btnSaveCfg');
+    if (btn) btn.disabled = true;
+    say('cfgState', '나이스에 실제로 요청해 인증키와 프록시를 확인하는 중입니다…', 'busy');
+
+    try {
+      const r = await window.Neis.verify(c);
+      /* 검증 도중 입력이 바뀌었으면 이 결과는 버립니다 */
+      if (cfgSig(currentCfg()) !== cfgSig(c)) return;
+      cfgCheck = { sig: cfgSig(c), level: r.level, mode: r.mode, message: r.message, at: Date.now() };
+      persistCfg(c);
+      say('cfgState', r.message, r.level);
+      console.info('[neis] verify', r);
+    } catch (e) {
+      say('cfgState', '검증 중 예기치 못한 오류가 발생했습니다.', 'err');
+      console.error('[neis] verify', e);
+    } finally {
+      if (btn) btn.disabled = false;
+      renderKeyChip();
     }
   }
 
@@ -449,8 +514,18 @@
       const c = JSON.parse(localStorage.getItem(LS_CFG) || '{}');
       setVal('fKey', c.key || '');
       setVal('fProxy', c.proxy || '');
+      cfgCheck = c.check || null;
+      const chk = activeCheck();
+      if (chk) say('cfgState', chk.message, chk.level);
       return c;
     } catch (e) { return {}; }
+  }
+
+  function onCfgInput() {
+    renderKeyChip();
+    const chk = activeCheck();
+    if (chk) say('cfgState', chk.message, chk.level);
+    else say('cfgState', '변경 사항이 있습니다. 설정 저장을 눌러 다시 검증하세요.', 'warn');
   }
 
 async function lookup() {
@@ -493,7 +568,12 @@ async function lookup() {
 
     window.__autoLoaded = true;
     console.info('[neis] lookup success', res);
-    say('lookupState', `${res.schoolName || name} · ${res.subjects.length}과목을 불러왔습니다.`, 'ok');
+    const chk = activeCheck();
+    const sample = !chk || chk.mode === 'sample';
+    say('lookupState',
+      `${res.schoolName || name} · ${res.subjects.length}과목을 불러왔습니다.` +
+      (sample ? ' 인증키가 확인되지 않은 샘플 모드라 일부 과목이 빠졌을 수 있습니다.' : ''),
+      sample ? 'warn' : 'ok');
     renderSoon();
 
   } catch (err) {
@@ -710,6 +790,8 @@ async function lookup() {
     on('btnReset', 'click', reset);
     on('btnLookup', 'click', lookup);
     on('btnSaveCfg', 'click', saveCfg);
+    on('fKey', 'input', onCfgInput);
+    on('fProxy', 'input', onCfgInput);
     on('btnSample', 'click', fillSample);
     on('btnBatch', 'click', runBatch);
     on('btnBatchPrint', 'click', printBatch);
@@ -743,6 +825,7 @@ async function lookup() {
     initSelects();
     initChecklists();
     loadCfg();
+    renderKeyChip();
     loadForm();
     bind();
     updateFitDisplay(collect());
@@ -762,30 +845,4 @@ async function lookup() {
     getSchool: () => PICKED_SCHOOL,
     setSchool: saveSchool
   };
-})();
-
-/* 인증키 상태 칩 */
-(function () {
-  var chip = document.getElementById('keyChip');
-  var tx   = document.getElementById('keyChipTx');
-  var key  = document.getElementById('fKey');
-  var prox = document.getElementById('fProxy');
-  var save = document.getElementById('btnSaveCfg');
-  if (!chip || !key) return;
-
-  function refresh() {
-    var hasKey = key.value.trim().length > 0;
-    var hasPx  = prox && prox.value.trim().length > 0;
-
-    chip.classList.toggle('is-on', hasKey);
-    tx.textContent = hasKey
-      ? '나이스 인증키 적용됨' + (hasPx ? ' · 프록시 연결' : '')
-      : '인증키 없음 · 직접 입력으로 진행';
-  }
-
-  key.addEventListener('input', refresh);
-  if (prox) prox.addEventListener('input', refresh);
-  if (save) save.addEventListener('click', function () { setTimeout(refresh, 60); });
-
-  refresh();
 })();
